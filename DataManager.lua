@@ -18,11 +18,16 @@ GetCoinsEvent.Name   = "GetCoinsEvent"
 GetCoinsEvent.Parent = ReplicatedStorage
 
 -- ── SkillTree bridge ──────────────────────────────────────────────────────────
--- These BindableEvents are created by SkillTreeServer.server.lua.
--- WaitForChild gives SkillTreeServer time to boot first.
-local CoinsChangedBind = ReplicatedStorage:WaitForChild("CoinsChangedBind", 10)
-local DeductCoinsBind  = ReplicatedStorage:WaitForChild("DeductCoinsBind",  10)
+-- These are created by SkillTreeServer.server.lua; WaitForChild lets it boot first.
+local CoinsChangedBind    = ReplicatedStorage:WaitForChild("CoinsChangedBind",    10)
+local DeductCoinsBind     = ReplicatedStorage:WaitForChild("DeductCoinsBind",     10)
+local GetSkillEffectsBind = ReplicatedStorage:WaitForChild("GetSkillEffectsBind", 10)
 -- ─────────────────────────────────────────────────────────────────────────────
+
+-- Rarity tier used to decide which coin multipliers apply on a roll.
+local RARITY_TIER = {
+	Common=0, Uncommon=1, Rare=2, Epic=3, Legendary=4, Mythic=5, Divine=6, Celestial=7,
+}
 
 -- ─────────────────────────────────────────────
 -- Data
@@ -111,31 +116,88 @@ end
 local COOLDOWN = 1.5
 
 RollEvent.OnServerEvent:Connect(function(player)
-	local now = tick()
-	if cooldowns[player] and (now - cooldowns[player]) < COOLDOWN then return end
-	cooldowns[player] = now
-
 	local data = playerData[player]
 	if not data then return end
 
-	local result      = SpiritRNG.RollSpirit()
-	local coinsEarned = SpiritRNG.GetBaseCoinValue(result)
+	-- Fetch live skill effects (reads in-memory data from SkillTreeServer — fast)
+	local effects = {}
+	if GetSkillEffectsBind then
+		local ok, res = pcall(function() return GetSkillEffectsBind:Invoke(player) end)
+		if ok and type(res) == "table" then effects = res end
+	end
+
+	-- Rate limiting with auto_delay skill factored in (0.35x at max = ~0.5 s cooldown)
+	local now = tick()
+	local effectiveCooldown = COOLDOWN * (effects.auto_delay or 1)
+	if cooldowns[player] and (now - cooldowns[player]) < effectiveCooldown then return end
+	cooldowns[player] = now
+
+	-- Roll with luck (rarer spirits get a weight boost based on luck_add total)
+	local result = SpiritRNG.RollSpiritWithLuck(effects.luck_add or 0)
+	local rarity = SpiritRNG.GetRarityName(result)
+
+	-- Rarity-specific coin multipliers stack upward through tiers:
+	--   rare_mult      applies to Rare+      (tier ≥ 2)
+	--   epic_mult      applies to Epic+      (tier ≥ 3)
+	--   mythic_mult    applies to Mythic+    (tier ≥ 5)
+	--   divine_mult    applies to Divine+    (tier ≥ 6)
+	--   celestial_mult applies to Celestial  (tier ≥ 7)
+	local tier       = RARITY_TIER[rarity] or 0
+	local rarityMult = 1
+	if tier >= 2 then rarityMult *= (effects.rare_mult      or 1) end
+	if tier >= 3 then rarityMult *= (effects.epic_mult      or 1) end
+	if tier >= 5 then rarityMult *= (effects.mythic_mult    or 1) end
+	if tier >= 6 then rarityMult *= (effects.divine_mult    or 1) end
+	if tier >= 7 then rarityMult *= (effects.celestial_mult or 1) end
+
+	local coinsEarned = math.floor(
+		SpiritRNG.GetBaseCoinValue(result) * (effects.coins_mult or 1) * rarityMult
+	)
+
+	-- Coin Rain: flat % chance to double the payout on any roll
+	local coinRainChance = effects.coin_rain or 0
+	if coinRainChance > 0 and math.random() < coinRainChance then
+		coinsEarned = coinsEarned * 2
+	end
 
 	data.inventory[result]  = (data.inventory[result] or 0) + 1
 	data.totalRolls        += 1
 	data.coins             += coinsEarned
 	dirtyFlags[player]      = true
 
-	-- Keep SkillTree's coin mirror in sync
 	if CoinsChangedBind then
 		CoinsChangedBind:Fire(player, data.coins)
 	end
 
-	print(("[DataManager] %s rolled %s | +%d coins | total: %d"):format(
-		player.Name, result, coinsEarned, data.coins
-		))
+	print(("[DataManager] %s rolled %s (%s) | +%d coins | total: %d"):format(
+		player.Name, result, rarity, coinsEarned, data.coins
+	))
 
 	RollEvent:FireClient(player, result, coinsEarned, data.coins)
+
+	-- Bonus Roll: chance to fire a second spirit automatically
+	local doubleChance = effects.double_roll or 0
+	if doubleChance > 0 and math.random() < doubleChance then
+		local result2 = SpiritRNG.RollSpiritWithLuck(effects.luck_add or 0)
+		local rarity2 = SpiritRNG.GetRarityName(result2)
+		local tier2   = RARITY_TIER[rarity2] or 0
+		local mult2   = 1
+		if tier2 >= 2 then mult2 *= (effects.rare_mult      or 1) end
+		if tier2 >= 3 then mult2 *= (effects.epic_mult      or 1) end
+		if tier2 >= 5 then mult2 *= (effects.mythic_mult    or 1) end
+		if tier2 >= 6 then mult2 *= (effects.divine_mult    or 1) end
+		if tier2 >= 7 then mult2 *= (effects.celestial_mult or 1) end
+		local coins2 = math.floor(SpiritRNG.GetBaseCoinValue(result2) * (effects.coins_mult or 1) * mult2)
+		if coinRainChance > 0 and math.random() < coinRainChance then coins2 = coins2 * 2 end
+
+		data.inventory[result2] = (data.inventory[result2] or 0) + 1
+		data.totalRolls        += 1
+		data.coins             += coins2
+		dirtyFlags[player]      = true
+
+		if CoinsChangedBind then CoinsChangedBind:Fire(player, data.coins) end
+		RollEvent:FireClient(player, result2, coins2, data.coins)
+	end
 end)
 
 -- ─────────────────────────────────────────────
@@ -152,14 +214,12 @@ if DeductCoinsBind then
 		data.coins         = math.max(0, data.coins - amount)
 		dirtyFlags[player] = true
 
-		-- Re-sync SkillTree mirror with the post-deduction total
+		-- Re-sync SkillTree mirror with the post-deduction total.
+		-- SkillTreeServer's CoinsChangedBind handler pushes the new total to the
+		-- client via SkillCoinsUpdateEvent — no separate RollEvent needed here.
 		if CoinsChangedBind then
 			CoinsChangedBind:Fire(player, data.coins)
 		end
-
-		-- Push updated coin count to the client HUD.
-		-- Passing nil as the roll result tells the client this is a coins-only update.
-		RollEvent:FireClient(player, nil, 0, data.coins)
 	end)
 end
 

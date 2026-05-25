@@ -69,16 +69,17 @@ local nodesFrame = mainFrame:WaitForChild("NodesFrame")
 -- Column step (horizontal): 1.5 · R     (so adjacent columns share their slanted edges)
 -- Row step (vertical):     √3 · R      (so same-column rows share their flat top/bottom edges)
 -- Odd columns shift DOWN by ½ row so they nestle between even-column rows.
-local HEX_R     = 75
+local HEX_R     = 90
 local HEX_W     = HEX_R * 2
 local HEX_H     = HEX_R * math.sqrt(3)
 local STEP_X    = HEX_R * 1.5
 local STEP_Y    = HEX_H
-local OUTLINE_W = 4
+local OUTLINE_W = 5
 
-local CANVAS_HALF = 3500
-local MIN_ZOOM    = 0.3
-local MAX_ZOOM    = 2.5
+local CANVAS_HALF      = 3500
+local MIN_ZOOM         = 0.3
+local MAX_ZOOM         = 2.5
+local LABEL_HIDE_ZOOM  = 0.70   -- below this zoom level, name text is hidden (icon only)
 
 -- ── Runtime state ────────────────────────────────────────────────────────────
 local isOpen         = false
@@ -96,6 +97,9 @@ local isDragging   = false
 local dragStart    = Vector2.new(0, 0)
 local dragOrigin   = Vector2.new(0, 0)
 local dragDistance = 0
+
+-- Forward declaration — defined later but called inside applyTransform
+local updateLabelVisibility
 
 -- ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -143,6 +147,7 @@ local function applyTransform()
 	if not canvas or not uiScaleInst then return end
 	uiScaleInst.Scale = canvasZoom
 	canvas.Position   = UDim2.new(0, canvasPos.X, 0, canvasPos.Y)
+	updateLabelVisibility()
 end
 
 local function treeCenter()
@@ -226,7 +231,7 @@ end
 local function buildTooltip()
 	local t = Instance.new("Frame")
 	t.Name                   = "SkillTooltip"
-	t.Size                   = UDim2.new(0, 220, 0, 100)
+	t.Size                   = UDim2.new(0, 220, 0, 118)
 	t.BackgroundColor3       = Color3.fromRGB(0, 0, 0)
 	t.BackgroundTransparency = 0
 	t.BorderSizePixel        = 0
@@ -254,9 +259,10 @@ local function buildTooltip()
 		return l
 	end
 
-	lbl("TitleLabel", 6,  22, 16, Color3.fromRGB(255, 255, 255))
-	lbl("DescLabel",  30, 42, 12, Color3.fromRGB(200, 200, 215), true)
-	lbl("CostLabel",  78, 16, 13, Color3.fromRGB(255, 220, 80))
+	lbl("TitleLabel",    6,  22, 16, Color3.fromRGB(255, 255, 255))
+	lbl("DescLabel",    30,  40, 12, Color3.fromRGB(200, 200, 215), true)
+	lbl("RequiresLabel",74,  16, 11, Color3.fromRGB(160, 200, 255))
+	lbl("CostLabel",    94,  18, 13, Color3.fromRGB(255, 220, 80))
 	return t
 end
 
@@ -264,6 +270,18 @@ local function showTooltip(node, skill)
 	if not tooltip then return end
 	tooltip:FindFirstChild("TitleLabel").Text = skill.DisplayName
 	tooltip:FindFirstChild("DescLabel").Text  = skill.Description
+
+	-- Build "Requires: X, Y" line
+	local reqNames = {}
+	for _, reqId in ipairs(skill.Requires) do
+		local s = SkillTree.GetSkill(reqId)
+		if s then table.insert(reqNames, s.DisplayName) end
+	end
+	local reqLbl = tooltip:FindFirstChild("RequiresLabel")
+	if reqLbl then
+		reqLbl.Text = #reqNames > 0 and ("Requires: " .. table.concat(reqNames, ", ")) or ""
+	end
+
 	tooltip:FindFirstChild("CostLabel").Text  =
 		skill.Cost == 0 and "FREE"
 		or ("Cost: " .. formatCoins(skill.Cost) .. " coins")
@@ -292,7 +310,7 @@ local function hideTooltip()
 	if tooltip then tooltip.Visible = false end
 end
 
--- Forward declaration so the click handler can reference it before it's defined
+-- Forward declaration — defined later but called in click handler
 local updateNodeVisual
 
 -- ── Node construction ────────────────────────────────────────────────────────
@@ -331,7 +349,6 @@ end
 local function buildNode(skill, onClick)
 	local cx, cy = nodePos(skill)
 
-	-- Container is sized to the hex bounding box so adjacent hexes touch.
 	local node = Instance.new("Frame")
 	node.Name                   = skill.Id
 	node.Size                   = UDim2.new(0, HEX_W, 0, HEX_H)
@@ -341,7 +358,7 @@ local function buildNode(skill, onClick)
 	node.ZIndex                 = 5
 	node.ClipsDescendants       = false
 
-	-- White hex outline (full size of container)
+	-- Border hex — always white (colour overwritten by updateNodeVisual)
 	local outline = makeHexLayer(node,
 		Color3.fromRGB(255, 255, 255),
 		UDim2.new(1, 0, 1, 0),
@@ -349,19 +366,37 @@ local function buildNode(skill, onClick)
 		5)
 	outline.Name = "Outline"
 
-	-- Black hex fill (slightly inset so the outline shows as a border)
+	-- Green fill hex (slightly inset)
 	local fill = makeHexLayer(node,
-		Color3.fromRGB(0, 0, 0),
+		Color3.fromRGB(30, 160, 60),
 		UDim2.new(1, -OUTLINE_W * 2, 1, -OUTLINE_W * 2),
 		UDim2.new(0, OUTLINE_W, 0, OUTLINE_W),
 		6)
 	fill.Name = "Fill"
 
-	-- Name label (upper-middle of the hex)
+	-- Icon — fixed pixel size so emojis render consistently across all nodes
+	if skill.Icon ~= "" then
+		local iconLbl = Instance.new("TextLabel", node)
+		iconLbl.Name                   = "IconLabel"
+		iconLbl.Size                   = UDim2.new(0.70, 0, 0.44, 0)
+		iconLbl.Position               = UDim2.new(0.15, 0, 0.05, 0)
+		iconLbl.BackgroundTransparency = 1
+		iconLbl.Text                   = skill.Icon
+		iconLbl.TextScaled             = false
+		iconLbl.TextSize               = 38           -- fixed px — keeps all emojis the same size
+		iconLbl.Font                   = Enum.Font.GothamBold
+		iconLbl.TextColor3             = Color3.fromRGB(255, 255, 255)
+		iconLbl.TextXAlignment         = Enum.TextXAlignment.Center
+		iconLbl.TextYAlignment         = Enum.TextYAlignment.Center
+		iconLbl.ZIndex                 = 8
+	end
+
+	-- Name label — TextScaled but clamped so long names stay readable
+	-- and short names don't balloon.  UITextSizeConstraint works alongside TextScaled.
 	local nameLbl = Instance.new("TextLabel", node)
 	nameLbl.Name                   = "NameLabel"
-	nameLbl.Size                   = UDim2.new(0.7, 0, 0.28, 0)
-	nameLbl.Position               = UDim2.new(0.15, 0, 0.22, 0)
+	nameLbl.Size                   = UDim2.new(0.90, 0, 0.42, 0)
+	nameLbl.Position               = UDim2.new(0.05, 0, 0.50, 0)
 	nameLbl.BackgroundTransparency = 1
 	nameLbl.Text                   = skill.DisplayName
 	nameLbl.TextColor3             = Color3.fromRGB(255, 255, 255)
@@ -369,22 +404,13 @@ local function buildNode(skill, onClick)
 	nameLbl.Font                   = Enum.Font.FredokaOne
 	nameLbl.TextXAlignment         = Enum.TextXAlignment.Center
 	nameLbl.TextYAlignment         = Enum.TextYAlignment.Center
+	nameLbl.TextWrapped            = true
 	nameLbl.ZIndex                 = 8
+	local sizeConstraint = Instance.new("UITextSizeConstraint", nameLbl)
+	sizeConstraint.MinTextSize = 9
+	sizeConstraint.MaxTextSize = 17
 
-	-- Cost label (lower-middle)
-	local costLbl = Instance.new("TextLabel", node)
-	costLbl.Name                   = "CostLabel"
-	costLbl.Size                   = UDim2.new(0.6, 0, 0.18, 0)
-	costLbl.Position               = UDim2.new(0.20, 0, 0.55, 0)
-	costLbl.BackgroundTransparency = 1
-	costLbl.Text                   = skill.Cost == 0 and "FREE" or formatCoins(skill.Cost)
-	costLbl.TextColor3             = Color3.fromRGB(255, 220, 80)
-	costLbl.TextScaled             = true
-	costLbl.Font                   = Enum.Font.FredokaOne
-	costLbl.TextXAlignment         = Enum.TextXAlignment.Center
-	costLbl.ZIndex                 = 8
-
-	-- Invisible click button covers the hex bounding box
+	-- Invisible click button
 	local btn = Instance.new("TextButton", node)
 	btn.Size                   = UDim2.new(1, 0, 1, 0)
 	btn.BackgroundTransparency = 1
@@ -400,11 +426,17 @@ end
 
 -- ── Node visual state ────────────────────────────────────────────────────────
 
-local STATE_COLORS = {
-	owned     = Color3.fromRGB(80, 220, 110),
-	available = Color3.fromRGB(255, 215, 70),
-	poor      = Color3.fromRGB(255, 90, 90),
-	locked    = Color3.fromRGB(110, 110, 130),
+-- fill color, outline color, text alpha (1 = faded)
+-- owned     → green  / white outline
+-- available → blue   / white outline  (prereqs met AND can afford)
+-- poor      → grey   / white outline  (prereqs met, can't afford yet)
+-- locked    → dark grey / white outline (prereqs not met)
+local WHITE = Color3.fromRGB(255, 255, 255)
+local STATE = {
+	owned     = { fill = Color3.fromRGB(40,  190,  80), outline = WHITE, alpha = 0   },
+	available = { fill = Color3.fromRGB(60,  130, 255), outline = WHITE, alpha = 0   },
+	poor      = { fill = Color3.fromRGB(75,   75,  88), outline = WHITE, alpha = 0   },
+	locked    = { fill = Color3.fromRGB(38,   38,  46), outline = WHITE, alpha = 0.5 },
 }
 
 function updateNodeVisual(skill)
@@ -412,34 +444,38 @@ function updateNodeVisual(skill)
 	if not node then return end
 
 	local outline = node:FindFirstChild("Outline")
+	local fill    = node:FindFirstChild("Fill")
 	local nameLbl = node:FindFirstChild("NameLabel")
-	local costLbl = node:FindFirstChild("CostLabel")
-	if not outline then return end
+	local iconLbl = node:FindFirstChild("IconLabel")
+	if not outline or not fill then return end
 
 	local owned      = unlockedSkills[skill.Id]
 	local prereqsMet = SkillTree.CanUnlock(skill.Id, unlockedSkills)
 	local canAfford  = currentCoins >= skill.Cost
 
+	local s
 	if owned then
-		setHexColor(outline, STATE_COLORS.owned)
-		nameLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
-		costLbl.Text       = "OWNED"
-		costLbl.TextColor3 = STATE_COLORS.owned
+		s = STATE.owned
 	elseif prereqsMet and canAfford then
-		setHexColor(outline, STATE_COLORS.available)
-		nameLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
-		costLbl.Text       = skill.Cost == 0 and "FREE" or formatCoins(skill.Cost)
-		costLbl.TextColor3 = Color3.fromRGB(255, 220, 80)
+		s = STATE.available
 	elseif prereqsMet then
-		setHexColor(outline, STATE_COLORS.poor)
-		nameLbl.TextColor3 = Color3.fromRGB(230, 230, 240)
-		costLbl.Text       = skill.Cost == 0 and "FREE" or formatCoins(skill.Cost)
-		costLbl.TextColor3 = STATE_COLORS.poor
+		s = STATE.poor
 	else
-		setHexColor(outline, STATE_COLORS.locked)
-		nameLbl.TextColor3 = Color3.fromRGB(140, 140, 160)
-		costLbl.Text       = "LOCKED"
-		costLbl.TextColor3 = Color3.fromRGB(140, 140, 160)
+		s = STATE.locked
+	end
+
+	setHexColor(outline, s.outline)
+	setHexColor(fill,    s.fill)
+	if nameLbl then nameLbl.TextTransparency = s.alpha end
+	if iconLbl then iconLbl.TextTransparency = s.alpha end
+end
+
+-- Show/hide name labels based on zoom level — zoomed out = icon only
+updateLabelVisibility = function()
+	local show = canvasZoom >= LABEL_HIDE_ZOOM
+	for _, node in pairs(nodeFrames) do
+		local lbl = node:FindFirstChild("NameLabel")
+		if lbl then lbl.Visible = show end
 	end
 end
 
@@ -471,11 +507,11 @@ local function onNodeClicked(skill)
 
 	if currentCoins < skill.Cost then
 		if node then
-			local outline = node:FindFirstChild("Outline")
-			if outline then
-				setHexColor(outline, Color3.fromRGB(255, 35, 35))
+			local fill = node:FindFirstChild("Fill")
+			if fill then
+				setHexColor(fill, Color3.fromRGB(200, 30, 30))
 				task.delay(0.6, function()
-					if outline and outline.Parent then updateNodeVisual(skill) end
+					if fill and fill.Parent then updateNodeVisual(skill) end
 				end)
 			end
 		end
@@ -496,6 +532,73 @@ local function onNodeClicked(skill)
 	BuySkillEvent:FireServer(skill.Id)
 end
 
+-- ── Connectors ───────────────────────────────────────────────────────────────
+
+local CONNECTOR_W     = 6
+local CONNECTOR_COLOR = Color3.fromRGB(20, 60, 20)
+
+local BRANCH_COLORS = {
+	-- UP path (blue — luck path into Auto Roll)
+	RollLuck1   = Color3.fromRGB(80,  150, 255),
+	RollLuck2   = Color3.fromRGB(80,  150, 255),
+	AutoRoll    = Color3.fromRGB(80,  150, 255),
+	Fortune     = Color3.fromRGB(80,  180, 255),
+	Destiny     = Color3.fromRGB(60,  210, 255),
+	-- DOWN branch (cyan — speed)
+	FasterAuto  = Color3.fromRGB(50,  200, 220),
+	TurboAuto   = Color3.fromRGB(40,  185, 220),
+	UltraAuto   = Color3.fromRGB(30,  170, 220),
+	-- LEFT branch (gold — coins)
+	CoinBoost1    = Color3.fromRGB(200, 150, 20),
+	CoinBoost2    = Color3.fromRGB(200, 150, 20),
+	RareBonus     = Color3.fromRGB(200, 150, 20),
+	EpicBonus     = Color3.fromRGB(200, 140, 15),
+	MythicBonus   = Color3.fromRGB(200, 120, 10),
+	DivineMult    = Color3.fromRGB(180, 100, 10),
+	CelestialMult = Color3.fromRGB(160,  80, 10),
+	FarmingGold   = Color3.fromRGB(200, 150, 20),
+	RandomBonus   = Color3.fromRGB(200, 150, 20),
+	CoinRain      = Color3.fromRGB(220, 170, 30),
+	-- RIGHT branch (orange-red — bonus rolls & luck)
+	BonusRoll  = Color3.fromRGB(220, 100, 40),
+	HotStreak  = Color3.fromRGB(210,  80, 20),
+	Jackpot    = Color3.fromRGB(200,  60, 10),
+	LuckySpin  = Color3.fromRGB(100, 160, 255),
+	EpicLuck   = Color3.fromRGB(80,  130, 255),
+}
+
+local function drawConnector(x1, y1, x2, y2, color)
+	local dx     = x2 - x1
+	local dy     = y2 - y1
+	local length = math.sqrt(dx * dx + dy * dy)
+	if length < 1 then return end
+
+	local line = Instance.new("Frame")
+	line.Name                   = "Connector"
+	line.AnchorPoint            = Vector2.new(0, 0.5)
+	line.Size                   = UDim2.new(0, length, 0, CONNECTOR_W)
+	line.Position               = UDim2.new(0, x1, 0, y1)
+	line.Rotation               = math.deg(math.atan2(dy, dx))
+	line.BackgroundColor3       = color or CONNECTOR_COLOR
+	line.BorderSizePixel        = 0
+	line.ZIndex                 = 3
+	line.Parent                 = canvas
+end
+
+local function drawConnectors()
+	for _, skill in ipairs(SkillTree.Skills) do
+		local cx, cy  = nodePos(skill)
+		local lineCol = BRANCH_COLORS[skill.Id] or CONNECTOR_COLOR
+		for _, reqId in ipairs(skill.Requires) do
+			local reqSkill = SkillTree.GetSkill(reqId)
+			if reqSkill then
+				local rx, ry = nodePos(reqSkill)
+				drawConnector(rx, ry, cx, cy, lineCol)
+			end
+		end
+	end
+end
+
 -- ── Build the full tree ──────────────────────────────────────────────────────
 
 local function buildTree()
@@ -504,12 +607,12 @@ local function buildTree()
 	end
 	nodeFrames = {}
 
-	-- Hexes touch directly at the grid — no connector lines.
 	for _, skill in ipairs(SkillTree.Skills) do
 		buildNode(skill, onNodeClicked)
 	end
 
 	updateAllNodes()
+	updateLabelVisibility()
 end
 
 -- ── Open / Close ─────────────────────────────────────────────────────────────

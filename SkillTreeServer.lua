@@ -41,6 +41,28 @@ local GetSkillsEvent     = makeRemote("RemoteFunction", "GetSkillsEvent")
 local SkillUnlockedEvent = makeRemote("RemoteEvent",    "SkillUnlockedEvent")  -- success → client
 local CoinsUpdateEvent   = makeRemote("RemoteEvent",    "SkillCoinsUpdateEvent") -- coin mirror → client
 
+-- BindableFunction called by DataManager on every roll to get computed effect values
+local GetSkillEffectsBind = Instance.new("BindableFunction")
+GetSkillEffectsBind.Name   = "GetSkillEffectsBind"
+GetSkillEffectsBind.Parent = ReplicatedStorage
+
+GetSkillEffectsBind.OnInvoke = function(player)
+	local data     = playerSkills[player]
+	local unlocked = data and data.unlocked or {}
+	return {
+		luck_add       = SkillTree.GetEffectValue("luck_add",       unlocked),
+		coins_mult     = SkillTree.GetEffectValue("coins_mult",     unlocked),
+		rare_mult      = SkillTree.GetEffectValue("rare_mult",      unlocked),
+		epic_mult      = SkillTree.GetEffectValue("epic_mult",      unlocked),
+		mythic_mult    = SkillTree.GetEffectValue("mythic_mult",    unlocked),
+		divine_mult    = SkillTree.GetEffectValue("divine_mult",    unlocked),
+		celestial_mult = SkillTree.GetEffectValue("celestial_mult", unlocked),
+		coin_rain      = SkillTree.GetEffectValue("coin_rain",      unlocked),
+		double_roll    = SkillTree.GetEffectValue("double_roll",    unlocked),
+		auto_delay     = SkillTree.GetEffectValue("auto_delay",     unlocked),
+	}
+end
+
 -- ─────────────────────────────────────────────
 -- In-memory store
 -- [player] = { unlocked = {[skillId]=true}, coins = number }

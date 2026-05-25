@@ -91,6 +91,18 @@ end
 -- Public API
 -- ─────────────────────────────────────────────
 
+local RARITY_TIER = {
+	Common    = 0,
+	Uncommon  = 1,
+	Rare      = 2,
+	Epic      = 3,
+	Legendary = 4,
+	Mythic    = 5,
+	Divine    = 6,
+	Celestial = 7,
+}
+local LUCK_SCALE = 50  -- each luck_add point × tier × LUCK_SCALE boosts that spirit's weight
+
 -- Correct weighted roll: one random number, binary-search the pool.
 function SpiritRNG.RollSpirit()
 	local roll = math.random() * totalWeight
@@ -100,6 +112,27 @@ function SpiritRNG.RollSpirit()
 		end
 	end
 	return "EarthSpiritPet"   -- fallback (should never trigger)
+end
+
+-- Luck-adjusted roll: rarer spirits get a weight boost proportional to luck_add.
+-- With max luck (~0.009) and LUCK_SCALE=50, Celestial weight is ~4x, Common stays 1x.
+function SpiritRNG.RollSpiritWithLuck(luckBonus)
+	if not luckBonus or luckBonus <= 0 then
+		return SpiritRNG.RollSpirit()
+	end
+	local adjTotal = 0
+	local adjPool  = {}
+	for _, spirit in ipairs(Spirits) do
+		local tier = RARITY_TIER[spirit.Rarity] or 0
+		local w    = (1000000 / spirit.Chance) * (1 + luckBonus * tier * LUCK_SCALE)
+		adjTotal  += w
+		table.insert(adjPool, { name = spirit.Name, cumulative = adjTotal })
+	end
+	local roll = math.random() * adjTotal
+	for _, entry in ipairs(adjPool) do
+		if roll <= entry.cumulative then return entry.name end
+	end
+	return "EarthSpiritPet"
 end
 
 function SpiritRNG.GetAllSpirits()
