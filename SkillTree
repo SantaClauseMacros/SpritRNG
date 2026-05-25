@@ -1,12 +1,8 @@
 -- SkillTree.lua  (ModuleScript in ReplicatedStorage)
 -- Single source of truth for every skill node.
--- Unchanged from original — no bugs found here.
+-- Layout is computed from Col/Row using a flat-top hex grid in SkillTreeClient.
 
 local SkillTree = {}
-
-SkillTree.HexSize = 56
-SkillTree.GapX    = 8
-SkillTree.GapY    = 6
 
 SkillTree.Skills = {
 

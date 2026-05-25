@@ -200,6 +200,12 @@ end)
 
 Players.PlayerAdded:Connect(loadData)
 
+-- Handle players who were already in the server when this script started
+-- (e.g. on a server-restart hot reload). PlayerAdded does NOT fire for them.
+for _, player in ipairs(Players:GetPlayers()) do
+	task.spawn(loadData, player)
+end
+
 Players.PlayerRemoving:Connect(function(player)
 	saveData(player)
 	playerData[player] = nil

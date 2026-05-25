@@ -1,13 +1,20 @@
--- SkillTreeClient.client.lua  (UPDATED)
--- Changes:
---   • MainFrame + NodesFrame are now full-screen (cover the whole viewport)
---   • A virtual Canvas lives inside NodesFrame — nodes are built on it
---   • LMB drag  → pans  the canvas
---   • Scroll wheel → zooms toward the mouse cursor
---   • Tree is automatically centred on screen when opened
---   • Deterministic per-skill position jitter gives an organic branching feel
---   • Pan and zoom wired once at init (no connection leaks on re-open)
---   • Drag-vs-click correctly distinguished (threshold = 6 px)
+-- SkillTreeClient.client.lua  (Hex-grid layout)
+-- Skill tree rendered as flat-top hexagons that touch face-to-face on the grid.
+--   • Hexagons are black with a white outline
+--   • No connector lines — adjacent hexes share edges instead
+--   • Background is fully black
+--   • LMB drag pans the canvas, scroll wheel zooms toward the cursor
+--   • Tree auto-centres on screen when opened
+--
+-- Requires a hexagon decal in ReplicatedStorage:
+--   Upload a flat-top hexagon image (transparent background, white silhouette)
+--   and either:
+--     (a) paste the asset id into HEX_IMAGE_FALLBACK below, or
+--     (b) place an ImageLabel (or StringValue) named "HexagonImage" in
+--         ReplicatedStorage whose Image / Value holds the asset id.
+--   Recommended aspect ratio: 2 : √3  (e.g. 256×222 or 512×443) so the hex
+--   exactly fills its bounding box. A square image also works but leaves a
+--   thin transparent strip above and below the hex.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService      = game:GetService("TweenService")
@@ -29,7 +36,23 @@ if not ToggleSkillTree then
 	ToggleSkillTree.Parent = ReplicatedStorage
 end
 
--- ── GUI references ────────────────────────────────────────────────────────────
+-- ── Hex image ────────────────────────────────────────────────────────────────
+local HEX_IMAGE_FALLBACK = "rbxassetid://0" -- TODO: replace with your hex image id
+local function resolveHexImage()
+	local node = ReplicatedStorage:FindFirstChild("HexagonImage")
+	if node then
+		if node:IsA("ImageLabel") or node:IsA("ImageButton") or node:IsA("Decal") then
+			if node.Image and node.Image ~= "" then return node.Image end
+		elseif node:IsA("StringValue") then
+			if node.Value and node.Value ~= "" then return node.Value end
+		end
+	end
+	return HEX_IMAGE_FALLBACK
+end
+local HEX_IMAGE   = resolveHexImage()
+local HAS_HEX_IMG = HEX_IMAGE ~= nil and HEX_IMAGE ~= "" and HEX_IMAGE ~= "rbxassetid://0"
+
+-- ── GUI references ───────────────────────────────────────────────────────────
 local player     = Players.LocalPlayer
 local playerGui  = player:WaitForChild("PlayerGui")
 local skillGui   = playerGui:WaitForChild("SkillTreeGui")
@@ -39,34 +62,42 @@ local closeBtn   = topBar:WaitForChild("CloseButton")
 local coinsLbl   = topBar:WaitForChild("CoinsLabel")
 local nodesFrame = mainFrame:WaitForChild("NodesFrame")
 
--- ── Layout constants ──────────────────────────────────────────────────────────
-local NODE_W      = 110          -- node card width  (px)
-local NODE_H      = 130          -- node card height (px)
-local STEP_X      = NODE_W + 60  -- horizontal stride between columns
-local STEP_Y      = NODE_H + 65  -- vertical   stride between rows
-local CANVAS_HALF = 3500         -- half of virtual canvas (full = 7000 × 7000)
+-- ── Hex grid (flat-top hexagons) ─────────────────────────────────────────────
+-- Flat-top hex with circumradius R:
+--   width  = 2R
+--   height = √3 · R
+-- Column step (horizontal): 1.5 · R     (so adjacent columns share their slanted edges)
+-- Row step (vertical):     √3 · R      (so same-column rows share their flat top/bottom edges)
+-- Odd columns shift DOWN by ½ row so they nestle between even-column rows.
+local HEX_R     = 75
+local HEX_W     = HEX_R * 2
+local HEX_H     = HEX_R * math.sqrt(3)
+local STEP_X    = HEX_R * 1.5
+local STEP_Y    = HEX_H
+local OUTLINE_W = 4
+
+local CANVAS_HALF = 3500
 local MIN_ZOOM    = 0.3
 local MAX_ZOOM    = 2.5
 
--- ── Runtime state ─────────────────────────────────────────────────────────────
+-- ── Runtime state ────────────────────────────────────────────────────────────
 local isOpen         = false
 local currentCoins   = 0
 local unlockedSkills = {}
 local nodeFrames     = {}
 local tooltip        = nil
 
-local canvas      = nil          -- Frame (child of nodesFrame)
-local uiScaleInst = nil          -- UIScale (child of canvas)
+local canvas      = nil
+local uiScaleInst = nil
 
--- Pan / zoom
-local canvasPos    = Vector2.new(0, 0)  -- canvas top-left in nodesFrame-local pixels
+local canvasPos    = Vector2.new(0, 0)
 local canvasZoom   = 1.0
 local isDragging   = false
 local dragStart    = Vector2.new(0, 0)
 local dragOrigin   = Vector2.new(0, 0)
 local dragDistance = 0
 
--- ── Helpers ───────────────────────────────────────────────────────────────────
+-- ── Helpers ──────────────────────────────────────────────────────────────────
 
 local function formatCoins(n)
 	n = n or 0
@@ -76,33 +107,20 @@ local function formatCoins(n)
 	return tostring(math.floor(n))
 end
 
--- Deterministic position jitter keyed on the skill Id string.
--- Same game session → same layout; still looks organic.
-local function jitter(id, scale)
-	local h = 0
-	for i = 1, #id do
-		h = (h * 31 + string.byte(id, i)) % 100000
-	end
-	local jx = ((h % 100)            - 50) * scale
-	local jy = (math.floor(h / 100) % 100 - 50) * scale
-	return jx, jy
-end
+-- True modulo (works for negative ints, e.g. -1 % 2 → 1)
+local function imod(a, b) return ((a % b) + b) % b end
 
--- Returns (canvasX, canvasY) — pixel offsets from the canvas top-left corner.
--- The logical tree centre sits at (CANVAS_HALF, CANVAS_HALF).
+-- Canvas-pixel centre of a node, using flat-top hex grid spacing.
 local function nodePos(skill)
-	local wx = skill.Col * STEP_X
-	local wy = skill.Row * STEP_Y
-	-- Stagger odd columns slightly so vertical branches feel less grid-like
-	if math.abs(skill.Col) % 2 == 1 then
-		wy = wy + STEP_Y * 0.35
+	local cx = CANVAS_HALF + skill.Col * STEP_X
+	local cy = CANVAS_HALF + skill.Row * STEP_Y
+	if imod(skill.Col, 2) == 1 then
+		cy = cy + STEP_Y / 2
 	end
-	local jx, jy = jitter(skill.Id, 22)
-	return CANVAS_HALF + wx + jx,
-	CANVAS_HALF + wy + jy
+	return cx, cy
 end
 
--- ── Canvas creation ───────────────────────────────────────────────────────────
+-- ── Canvas ───────────────────────────────────────────────────────────────────
 
 local function createCanvas()
 	if canvas and canvas.Parent then canvas:Destroy() end
@@ -127,23 +145,20 @@ local function applyTransform()
 	canvas.Position   = UDim2.new(0, canvasPos.X, 0, canvasPos.Y)
 end
 
--- Compute the average canvas-space position of all skill nodes.
 local function treeCenter()
 	local sumX, sumY, n = 0, 0, 0
 	for _, skill in ipairs(SkillTree.Skills) do
 		local px, py = nodePos(skill)
 		sumX += px; sumY += py; n += 1
 	end
-	return (n > 0 and sumX / n or CANVAS_HALF),
-	(n > 0 and sumY / n or CANVAS_HALF)
+	if n == 0 then return CANVAS_HALF, CANVAS_HALF end
+	return sumX / n, sumY / n
 end
 
--- Shift the canvas so the tree's visual centre lands on the screen centre.
 local function centreView()
-	task.wait()   -- one frame so AbsoluteSize is valid
-	local sf      = nodesFrame.AbsoluteSize
+	task.wait()
+	local sf       = nodesFrame.AbsoluteSize
 	local tcx, tcy = treeCenter()
-	-- We need: canvasPos + treeCenter * zoom == screenCentre
 	canvasPos = Vector2.new(
 		sf.X / 2 - tcx * canvasZoom,
 		sf.Y / 2 - tcy * canvasZoom
@@ -151,28 +166,24 @@ local function centreView()
 	applyTransform()
 end
 
--- ── Pan & Zoom ────────────────────────────────────────────────────────────────
+-- ── Pan & Zoom ───────────────────────────────────────────────────────────────
 
--- Zoom toward an arbitrary point (nodesFrame-local coords).
 local function doZoom(factor, localMouse)
 	local newZoom = math.clamp(canvasZoom * factor, MIN_ZOOM, MAX_ZOOM)
 	if newZoom == canvasZoom then return end
 	local ratio = newZoom / canvasZoom
-	-- Keep the canvas point under localMouse fixed on screen
 	canvasPos  = localMouse - (localMouse - canvasPos) * ratio
 	canvasZoom = newZoom
 	applyTransform()
 end
 
--- ── Input wiring (called once at startup) ─────────────────────────────────────
 local inputWired = false
 
 local function wireInput()
 	if inputWired then return end
 	inputWired = true
 
-	-- LMB down → begin drag
-	UserInputService.InputBegan:Connect(function(input, _)
+	UserInputService.InputBegan:Connect(function(input)
 		if not isOpen then return end
 		if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
 		isDragging   = true
@@ -181,7 +192,6 @@ local function wireInput()
 		dragOrigin   = canvasPos
 	end)
 
-	-- Mouse move → pan canvas; scroll wheel → zoom
 	UserInputService.InputChanged:Connect(function(input)
 		if not isOpen then return end
 
@@ -204,7 +214,6 @@ local function wireInput()
 		end
 	end)
 
-	-- LMB up → end drag
 	UserInputService.InputEnded:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 then
 			isDragging = false
@@ -212,41 +221,42 @@ local function wireInput()
 	end)
 end
 
--- ── Tooltip ───────────────────────────────────────────────────────────────────
+-- ── Tooltip ──────────────────────────────────────────────────────────────────
 
 local function buildTooltip()
 	local t = Instance.new("Frame")
 	t.Name                   = "SkillTooltip"
-	t.Size                   = UDim2.new(0, 210, 0, 90)
-	t.BackgroundColor3       = Color3.fromRGB(18, 18, 30)
-	t.BackgroundTransparency = 0.05
+	t.Size                   = UDim2.new(0, 220, 0, 100)
+	t.BackgroundColor3       = Color3.fromRGB(0, 0, 0)
+	t.BackgroundTransparency = 0
 	t.BorderSizePixel        = 0
 	t.Visible                = false
 	t.ZIndex                 = 50
 	t.AnchorPoint            = Vector2.new(0.5, 1)
 	t.Parent                 = mainFrame
-	Instance.new("UICorner", t).CornerRadius = UDim.new(0, 10)
+	Instance.new("UICorner", t).CornerRadius = UDim.new(0, 8)
 	local st = Instance.new("UIStroke", t)
-	st.Color = Color3.fromRGB(160, 160, 255); st.Thickness = 1.5
+	st.Color     = Color3.fromRGB(255, 255, 255)
+	st.Thickness = 1.5
 
 	local function lbl(name, posY, h, sz, col, wrap)
-		local l                    = Instance.new("TextLabel", t)
-		l.Name                     = name
-		l.Size                     = UDim2.new(1, -10, 0, h)
-		l.Position                 = UDim2.new(0, 5, 0, posY)
-		l.BackgroundTransparency   = 1
-		l.TextColor3               = col
-		l.Font                     = Enum.Font.FredokaOne
-		l.TextSize                 = sz
-		l.TextXAlignment           = Enum.TextXAlignment.Center
-		l.TextWrapped              = wrap or false
-		l.ZIndex                   = 51
+		local l                  = Instance.new("TextLabel", t)
+		l.Name                   = name
+		l.Size                   = UDim2.new(1, -12, 0, h)
+		l.Position               = UDim2.new(0, 6, 0, posY)
+		l.BackgroundTransparency = 1
+		l.TextColor3             = col
+		l.Font                   = Enum.Font.FredokaOne
+		l.TextSize               = sz
+		l.TextXAlignment         = Enum.TextXAlignment.Center
+		l.TextWrapped            = wrap or false
+		l.ZIndex                 = 51
 		return l
 	end
 
-	lbl("TitleLabel", 5,  22, 15, Color3.fromRGB(255, 255, 255))
-	lbl("DescLabel",  28, 38, 11, Color3.fromRGB(185, 185, 210), true)
-	lbl("CostLabel",  70, 16, 12, Color3.fromRGB(255, 220, 80))
+	lbl("TitleLabel", 6,  22, 16, Color3.fromRGB(255, 255, 255))
+	lbl("DescLabel",  30, 42, 12, Color3.fromRGB(200, 200, 215), true)
+	lbl("CostLabel",  78, 16, 13, Color3.fromRGB(255, 220, 80))
 	return t
 end
 
@@ -260,13 +270,20 @@ local function showTooltip(node, skill)
 
 	local absPos  = node.AbsolutePosition
 	local mainPos = mainFrame.AbsolutePosition
-	local halfW   = 105
+	local halfW   = 110
 	local cx = math.clamp(
 		absPos.X + node.AbsoluteSize.X / 2 - mainPos.X,
 		halfW + 4,
 		mainFrame.AbsoluteSize.X - halfW - 4
 	)
 	local cy = absPos.Y - mainPos.Y - 6
+	-- If the tooltip would clip off the top of the screen, drop it below the node.
+	if cy < 110 then
+		cy = absPos.Y + node.AbsoluteSize.Y - mainPos.Y + 110
+		tooltip.AnchorPoint = Vector2.new(0.5, 1)
+	else
+		tooltip.AnchorPoint = Vector2.new(0.5, 1)
+	end
 	tooltip.Position = UDim2.new(0, cx, 0, cy)
 	tooltip.Visible  = true
 end
@@ -275,206 +292,154 @@ local function hideTooltip()
 	if tooltip then tooltip.Visible = false end
 end
 
--- ── Connector lines ───────────────────────────────────────────────────────────
+-- Forward declaration so the click handler can reference it before it's defined
+local updateNodeVisual
 
-local function drawLine(ax, ay, bx, by, owned)
-	local dx  = bx - ax
-	local dy  = by - ay
-	local len = math.sqrt(dx * dx + dy * dy)
-	local ang = math.deg(math.atan2(dy, dx))
+-- ── Node construction ────────────────────────────────────────────────────────
 
-	local line = Instance.new("Frame")
-	line.Size             = UDim2.new(0, len, 0, 5)
-	line.Position         = UDim2.new(0, ax,  0, ay)
-	line.AnchorPoint      = Vector2.new(0, 0.5)
-	line.Rotation         = ang
-	line.BackgroundColor3 = owned
-		and Color3.fromRGB(65, 215, 100)
-		or  Color3.fromRGB(58, 58, 82)
-	line.BorderSizePixel  = 0
-	line.ZIndex           = 2
-	Instance.new("UICorner", line).CornerRadius = UDim.new(1, 0)
-	line.Parent = canvas
-	return line
+local function makeHexLayer(parent, color, sizeUDim, posUDim, zIndex)
+	local hex
+	if HAS_HEX_IMG then
+		hex             = Instance.new("ImageLabel")
+		hex.Image       = HEX_IMAGE
+		hex.ImageColor3 = color
+		hex.ScaleType   = Enum.ScaleType.Fit
+		hex.BackgroundTransparency = 1
+	else
+		-- Fallback while the hex image hasn't been uploaded yet:
+		-- a coloured rounded rectangle so the layout is still visible.
+		hex = Instance.new("Frame")
+		hex.BackgroundColor3 = color
+		Instance.new("UICorner", hex).CornerRadius = UDim.new(0, 10)
+	end
+	hex.BorderSizePixel = 0
+	hex.Size            = sizeUDim
+	hex.Position        = posUDim
+	hex.ZIndex          = zIndex
+	hex.Parent          = parent
+	return hex
 end
 
--- ── Node construction ─────────────────────────────────────────────────────────
+local function setHexColor(hex, color)
+	if hex:IsA("ImageLabel") then
+		hex.ImageColor3 = color
+	else
+		hex.BackgroundColor3 = color
+	end
+end
 
-local function buildNode(skill)
+local function buildNode(skill, onClick)
 	local cx, cy = nodePos(skill)
 
+	-- Container is sized to the hex bounding box so adjacent hexes touch.
 	local node = Instance.new("Frame")
-	node.Name             = skill.Id
-	node.Size             = UDim2.new(0, NODE_W, 0, NODE_H)
-	node.Position         = UDim2.new(0, cx - NODE_W / 2, 0, cy - NODE_H / 2)
-	node.BackgroundColor3 = skill.NodeColor
-	node.BorderSizePixel  = 0
-	node.ZIndex           = 5
-	node.ClipsDescendants = false
-	Instance.new("UICorner", node).CornerRadius = UDim.new(0, 16)
+	node.Name                   = skill.Id
+	node.Size                   = UDim2.new(0, HEX_W, 0, HEX_H)
+	node.Position               = UDim2.new(0, cx - HEX_W / 2, 0, cy - HEX_H / 2)
+	node.BackgroundTransparency = 1
+	node.BorderSizePixel        = 0
+	node.ZIndex                 = 5
+	node.ClipsDescendants       = false
 
-	-- Drop shadow (rendered below the node)
-	local shadow = Instance.new("Frame", node)
-	shadow.Size                   = UDim2.new(1, 10, 1, 10)
-	shadow.Position               = UDim2.new(0, -5, 0, 6)
-	shadow.BackgroundColor3       = Color3.fromRGB(0, 0, 0)
-	shadow.BackgroundTransparency = 0.62
-	shadow.BorderSizePixel        = 0
-	shadow.ZIndex                 = 4
-	Instance.new("UICorner", shadow).CornerRadius = UDim.new(0, 19)
+	-- White hex outline (full size of container)
+	local outline = makeHexLayer(node,
+		Color3.fromRGB(255, 255, 255),
+		UDim2.new(1, 0, 1, 0),
+		UDim2.new(0, 0, 0, 0),
+		5)
+	outline.Name = "Outline"
 
-	-- Stroke / border
-	local stroke = Instance.new("UIStroke", node)
-	stroke.Color        = Color3.fromRGB(255, 255, 255)
-	stroke.Thickness    = 2.5
-	stroke.Transparency = 0.55
+	-- Black hex fill (slightly inset so the outline shows as a border)
+	local fill = makeHexLayer(node,
+		Color3.fromRGB(0, 0, 0),
+		UDim2.new(1, -OUTLINE_W * 2, 1, -OUTLINE_W * 2),
+		UDim2.new(0, OUTLINE_W, 0, OUTLINE_W),
+		6)
+	fill.Name = "Fill"
 
-	-- Star icon placeholder
-	local star = Instance.new("TextLabel", node)
-	star.Size                   = UDim2.new(0.68, 0, 0.42, 0)
-	star.Position               = UDim2.new(0.16, 0, 0.04, 0)
-	star.BackgroundTransparency = 1
-	star.Text                   = "⭐"
-	star.TextScaled             = true
-	star.Font                   = Enum.Font.GothamBold
-	star.ZIndex                 = 6
-
-	-- Name label
+	-- Name label (upper-middle of the hex)
 	local nameLbl = Instance.new("TextLabel", node)
 	nameLbl.Name                   = "NameLabel"
-	nameLbl.Size                   = UDim2.new(1, -6, 0, 28)
-	nameLbl.Position               = UDim2.new(0, 3, 0.47, 0)
+	nameLbl.Size                   = UDim2.new(0.7, 0, 0.28, 0)
+	nameLbl.Position               = UDim2.new(0.15, 0, 0.22, 0)
 	nameLbl.BackgroundTransparency = 1
 	nameLbl.Text                   = skill.DisplayName
 	nameLbl.TextColor3             = Color3.fromRGB(255, 255, 255)
 	nameLbl.TextScaled             = true
 	nameLbl.Font                   = Enum.Font.FredokaOne
 	nameLbl.TextXAlignment         = Enum.TextXAlignment.Center
-	nameLbl.ZIndex                 = 6
+	nameLbl.TextYAlignment         = Enum.TextYAlignment.Center
+	nameLbl.ZIndex                 = 8
 
-	-- Cost pill
-	local costPill = Instance.new("Frame", node)
-	costPill.Size                   = UDim2.new(0.9, 0, 0, 22)
-	costPill.Position               = UDim2.new(0.05, 0, 0.79, 0)
-	costPill.BackgroundColor3       = Color3.fromRGB(0, 0, 0)
-	costPill.BackgroundTransparency = 0.42
-	costPill.BorderSizePixel        = 0
-	costPill.ZIndex                 = 6
-	Instance.new("UICorner", costPill).CornerRadius = UDim.new(0, 6)
-	local costLbl = Instance.new("TextLabel", costPill)
+	-- Cost label (lower-middle)
+	local costLbl = Instance.new("TextLabel", node)
 	costLbl.Name                   = "CostLabel"
-	costLbl.Size                   = UDim2.new(1, 0, 1, 0)
+	costLbl.Size                   = UDim2.new(0.6, 0, 0.18, 0)
+	costLbl.Position               = UDim2.new(0.20, 0, 0.55, 0)
 	costLbl.BackgroundTransparency = 1
-	costLbl.Text                   = skill.Cost == 0 and "FREE"
-		or ("🪙 " .. formatCoins(skill.Cost))
+	costLbl.Text                   = skill.Cost == 0 and "FREE" or formatCoins(skill.Cost)
 	costLbl.TextColor3             = Color3.fromRGB(255, 220, 80)
 	costLbl.TextScaled             = true
 	costLbl.Font                   = Enum.Font.FredokaOne
 	costLbl.TextXAlignment         = Enum.TextXAlignment.Center
-	costLbl.ZIndex                 = 7
+	costLbl.ZIndex                 = 8
 
-	-- Lock overlay (visible when prereqs not met)
-	local lockOv = Instance.new("Frame", node)
-	lockOv.Name                   = "LockOverlay"
-	lockOv.Size                   = UDim2.new(1, 0, 1, 0)
-	lockOv.BackgroundColor3       = Color3.fromRGB(0, 0, 0)
-	lockOv.BackgroundTransparency = 0.38
-	lockOv.BorderSizePixel        = 0
-	lockOv.ZIndex                 = 7
-	Instance.new("UICorner", lockOv).CornerRadius = UDim.new(0, 16)
-	local lockIco = Instance.new("TextLabel", lockOv)
-	lockIco.Size                   = UDim2.new(0.5, 0, 0.42, 0)
-	lockIco.Position               = UDim2.new(0.25, 0, 0.22, 0)
-	lockIco.BackgroundTransparency = 1
-	lockIco.Text                   = "🔒"
-	lockIco.TextScaled             = true
-	lockIco.Font                   = Enum.Font.GothamBold
-	lockIco.ZIndex                 = 8
-
-	-- Check badge (visible when owned)
-	local checkBadge = Instance.new("Frame", node)
-	checkBadge.Name             = "CheckBadge"
-	checkBadge.Size             = UDim2.new(0, 24, 0, 24)
-	checkBadge.Position         = UDim2.new(1, -26, 0, 2)
-	checkBadge.BackgroundColor3 = Color3.fromRGB(50, 205, 90)
-	checkBadge.BorderSizePixel  = 0
-	checkBadge.Visible          = false
-	checkBadge.ZIndex           = 8
-	Instance.new("UICorner", checkBadge).CornerRadius = UDim.new(1, 0)
-	local checkTxt = Instance.new("TextLabel", checkBadge)
-	checkTxt.Size                   = UDim2.new(1, 0, 1, 0)
-	checkTxt.BackgroundTransparency = 1
-	checkTxt.Text                   = "✓"
-	checkTxt.TextScaled             = true
-	checkTxt.Font                   = Enum.Font.GothamBold
-	checkTxt.TextColor3             = Color3.fromRGB(255, 255, 255)
-	checkTxt.ZIndex                 = 9
-
-	-- Invisible click button on top
+	-- Invisible click button covers the hex bounding box
 	local btn = Instance.new("TextButton", node)
 	btn.Size                   = UDim2.new(1, 0, 1, 0)
 	btn.BackgroundTransparency = 1
 	btn.Text                   = ""
 	btn.ZIndex                 = 10
-	btn.MouseButton1Click:Connect(function() onNodeClicked(skill) end)
+	btn.MouseButton1Click:Connect(function() onClick(skill) end)
 	btn.MouseEnter:Connect(function() showTooltip(node, skill) end)
 	btn.MouseLeave:Connect(function() hideTooltip() end)
 
-	node.Parent           = canvas
-	nodeFrames[skill.Id]  = node
+	node.Parent          = canvas
+	nodeFrames[skill.Id] = node
 end
 
--- ── Node visual state ─────────────────────────────────────────────────────────
+-- ── Node visual state ────────────────────────────────────────────────────────
 
-local function updateNodeVisual(skill)
+local STATE_COLORS = {
+	owned     = Color3.fromRGB(80, 220, 110),
+	available = Color3.fromRGB(255, 215, 70),
+	poor      = Color3.fromRGB(255, 90, 90),
+	locked    = Color3.fromRGB(110, 110, 130),
+}
+
+function updateNodeVisual(skill)
 	local node = nodeFrames[skill.Id]
 	if not node then return end
+
+	local outline = node:FindFirstChild("Outline")
+	local nameLbl = node:FindFirstChild("NameLabel")
+	local costLbl = node:FindFirstChild("CostLabel")
+	if not outline then return end
 
 	local owned      = unlockedSkills[skill.Id]
 	local prereqsMet = SkillTree.CanUnlock(skill.Id, unlockedSkills)
 	local canAfford  = currentCoins >= skill.Cost
-	local lockOv     = node:FindFirstChild("LockOverlay")
-	local check      = node:FindFirstChild("CheckBadge")
-	local stroke     = node:FindFirstChildOfClass("UIStroke")
 
 	if owned then
-		if lockOv  then lockOv.Visible  = false end
-		if check   then check.Visible   = true  end
-		if stroke  then
-			stroke.Color        = Color3.fromRGB(50, 220, 90)
-			stroke.Transparency = 0
-		end
-		node.BackgroundTransparency = 0
-
+		setHexColor(outline, STATE_COLORS.owned)
+		nameLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+		costLbl.Text       = "OWNED"
+		costLbl.TextColor3 = STATE_COLORS.owned
 	elseif prereqsMet and canAfford then
-		-- Available & affordable → gold border
-		if lockOv  then lockOv.Visible = false end
-		if check   then check.Visible  = false end
-		if stroke  then
-			stroke.Color        = Color3.fromRGB(255, 215, 50)
-			stroke.Transparency = 0
-		end
-		node.BackgroundTransparency = 0
-
+		setHexColor(outline, STATE_COLORS.available)
+		nameLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+		costLbl.Text       = skill.Cost == 0 and "FREE" or formatCoins(skill.Cost)
+		costLbl.TextColor3 = Color3.fromRGB(255, 220, 80)
 	elseif prereqsMet then
-		-- Available but can't afford → red border
-		if lockOv  then lockOv.Visible = false end
-		if check   then check.Visible  = false end
-		if stroke  then
-			stroke.Color        = Color3.fromRGB(255, 60, 60)
-			stroke.Transparency = 0.2
-		end
-		node.BackgroundTransparency = 0.15
-
+		setHexColor(outline, STATE_COLORS.poor)
+		nameLbl.TextColor3 = Color3.fromRGB(230, 230, 240)
+		costLbl.Text       = skill.Cost == 0 and "FREE" or formatCoins(skill.Cost)
+		costLbl.TextColor3 = STATE_COLORS.poor
 	else
-		-- Locked
-		if lockOv  then lockOv.Visible = true  end
-		if check   then check.Visible  = false end
-		if stroke  then
-			stroke.Color        = Color3.fromRGB(110, 110, 138)
-			stroke.Transparency = 0.5
-		end
-		node.BackgroundTransparency = 0.45
+		setHexColor(outline, STATE_COLORS.locked)
+		nameLbl.TextColor3 = Color3.fromRGB(140, 140, 160)
+		costLbl.Text       = "LOCKED"
+		costLbl.TextColor3 = Color3.fromRGB(140, 140, 160)
 	end
 end
 
@@ -484,15 +449,14 @@ local function updateAllNodes()
 	end
 end
 
--- ── Click handler ─────────────────────────────────────────────────────────────
+-- ── Click handler ────────────────────────────────────────────────────────────
 
-function onNodeClicked(skill)
-	if dragDistance > 6 then return end   -- this was a pan drag, not a tap
+local function onNodeClicked(skill)
+	if dragDistance > 6 then return end
 	if unlockedSkills[skill.Id] then return end
 
 	local node = nodeFrames[skill.Id]
 
-	-- Missing prerequisites → shake node
 	if not SkillTree.CanUnlock(skill.Id, unlockedSkills) then
 		if node then
 			task.spawn(function()
@@ -505,70 +469,50 @@ function onNodeClicked(skill)
 		return
 	end
 
-	-- Can't afford → flash red stroke
 	if currentCoins < skill.Cost then
 		if node then
-			local stroke = node:FindFirstChildOfClass("UIStroke")
-			if stroke then
-				stroke.Color = Color3.fromRGB(255, 35, 35)
+			local outline = node:FindFirstChild("Outline")
+			if outline then
+				setHexColor(outline, Color3.fromRGB(255, 35, 35))
 				task.delay(0.6, function()
-					if stroke and stroke.Parent then updateNodeVisual(skill) end
+					if outline and outline.Parent then updateNodeVisual(skill) end
 				end)
 			end
 		end
 		return
 	end
 
-	-- All good → pulse + fire server
 	if node then
 		TweenService:Create(node,
 			TweenInfo.new(0.1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-			{ Size = UDim2.new(0, NODE_W * 1.12, 0, NODE_H * 1.12) }):Play()
+			{ Size = UDim2.new(0, HEX_W * 1.12, 0, HEX_H * 1.12) }):Play()
 		task.delay(0.1, function()
 			TweenService:Create(node,
 				TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
-				{ Size = UDim2.new(0, NODE_W, 0, NODE_H) }):Play()
+				{ Size = UDim2.new(0, HEX_W, 0, HEX_H) }):Play()
 		end)
 	end
 
 	BuySkillEvent:FireServer(skill.Id)
 end
 
--- ── Build the full tree ───────────────────────────────────────────────────────
+-- ── Build the full tree ──────────────────────────────────────────────────────
 
 local function buildTree()
-	-- Clear previous canvas contents (keep UIScale)
 	for _, child in ipairs(canvas:GetChildren()) do
 		if not child:IsA("UIScale") then child:Destroy() end
 	end
 	nodeFrames = {}
 
-	local lookup = {}
+	-- Hexes touch directly at the grid — no connector lines.
 	for _, skill in ipairs(SkillTree.Skills) do
-		lookup[skill.Id] = skill
-	end
-
-	-- Draw connectors first so they sit behind nodes
-	for _, skill in ipairs(SkillTree.Skills) do
-		local tx, ty = nodePos(skill)
-		for _, reqId in ipairs(skill.Requires) do
-			local req = lookup[reqId]
-			if req then
-				local fx, fy = nodePos(req)
-				drawLine(fx, fy, tx, ty, unlockedSkills[reqId])
-			end
-		end
-	end
-
-	-- Nodes on top
-	for _, skill in ipairs(SkillTree.Skills) do
-		buildNode(skill)
+		buildNode(skill, onNodeClicked)
 	end
 
 	updateAllNodes()
 end
 
--- ── Open / Close ──────────────────────────────────────────────────────────────
+-- ── Open / Close ─────────────────────────────────────────────────────────────
 
 local function openTree()
 	if isOpen then return end
@@ -576,11 +520,11 @@ local function openTree()
 	canvasZoom = 1.0
 
 	mainFrame.BackgroundTransparency = 1
-	mainFrame.Visible = true
+	mainFrame.Visible                = true
 
 	TweenService:Create(mainFrame,
 		TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-		{ BackgroundTransparency = 0.08 }):Play()
+		{ BackgroundTransparency = 0 }):Play()
 
 	task.spawn(function()
 		local data     = GetSkillsEvent:InvokeServer()
@@ -611,31 +555,30 @@ local function closeTree()
 			canvas      = nil
 			uiScaleInst = nil
 		end
+		nodeFrames = {}
 	end)
 end
 
--- ── Initialise frames & GUI ───────────────────────────────────────────────────
+-- ── Initialise frames & GUI ──────────────────────────────────────────────────
 
 skillGui.IgnoreGuiInset = true
 
--- MainFrame: full screen
 mainFrame.Visible                = false
 mainFrame.AnchorPoint            = Vector2.new(0, 0)
 mainFrame.Size                   = UDim2.new(1, 0, 1, 0)
 mainFrame.Position               = UDim2.new(0, 0, 0, 0)
-mainFrame.BackgroundColor3       = Color3.fromRGB(8, 8, 18)
-mainFrame.BackgroundTransparency = 0.08
+mainFrame.BackgroundColor3       = Color3.fromRGB(0, 0, 0)
+mainFrame.BackgroundTransparency = 0
 mainFrame.BorderSizePixel        = 0
 
--- NodesFrame: full screen, clips canvas children
 nodesFrame.AnchorPoint            = Vector2.new(0, 0)
 nodesFrame.Size                   = UDim2.new(1, 0, 1, 0)
 nodesFrame.Position               = UDim2.new(0, 0, 0, 0)
-nodesFrame.BackgroundTransparency = 1
+nodesFrame.BackgroundColor3       = Color3.fromRGB(0, 0, 0)
+nodesFrame.BackgroundTransparency = 0
 nodesFrame.ClipsDescendants       = true
 nodesFrame.BorderSizePixel        = 0
 
--- TopBar always renders on top of the canvas
 topBar.ZIndex = 20
 for _, child in ipairs(topBar:GetDescendants()) do
 	if child:IsA("GuiObject") then child.ZIndex = 21 end
@@ -644,7 +587,7 @@ end
 tooltip = buildTooltip()
 wireInput()
 
--- ── Remote event handlers ─────────────────────────────────────────────────────
+-- ── Remote handlers ──────────────────────────────────────────────────────────
 
 ToggleSkillTree.Event:Connect(function()
 	if isOpen then closeTree() else openTree() end
@@ -652,7 +595,6 @@ end)
 
 closeBtn.MouseButton1Click:Connect(closeTree)
 
--- Skill successfully purchased on the server
 SkillUnlockedEvent.OnClientEvent:Connect(function(skillId, newCoins)
 	unlockedSkills[skillId] = true
 	currentCoins  = newCoins
@@ -662,17 +604,16 @@ SkillUnlockedEvent.OnClientEvent:Connect(function(skillId, newCoins)
 	if node then
 		TweenService:Create(node,
 			TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-			{ Size = UDim2.new(0, NODE_W * 1.2, 0, NODE_H * 1.2) }):Play()
+			{ Size = UDim2.new(0, HEX_W * 1.2, 0, HEX_H * 1.2) }):Play()
 		task.delay(0.15, function()
 			TweenService:Create(node,
 				TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
-				{ Size = UDim2.new(0, NODE_W, 0, NODE_H) }):Play()
+				{ Size = UDim2.new(0, HEX_W, 0, HEX_H) }):Play()
 		end)
 	end
 	updateAllNodes()
 end)
 
--- Coin total refreshed by DataManager
 CoinsUpdateEvent.OnClientEvent:Connect(function(newCoins)
 	currentCoins  = newCoins
 	coinsLbl.Text = "🪙 " .. formatCoins(currentCoins)
