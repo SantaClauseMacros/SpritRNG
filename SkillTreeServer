@@ -1,0 +1,204 @@
+-- SkillTreeServer.server.lua  (Script in ServerScriptService)
+-- FIXED:
+--   • Coins stripped from SkillTree_v1 DataStore — only unlocked skills saved.
+--   • CoinsChangedBind now actually updates data.coins so purchases work.
+--   • DeductCoinsBind fires the coin deduction through DataManager.
+--   • SkillCoinsUpdateEvent fires to client so the UI coin display stays live.
+--   • UpdateAsync replaced with SetAsync for skills-only saves (simpler + correct).
+--   • SkillUnlockedEvent now sends updated coin total back to client.
+
+local Players           = game:GetService("Players")
+local DataStoreService  = game:GetService("DataStoreService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local SkillTree = require(ReplicatedStorage:WaitForChild("SkillTree"))
+
+local SkillDS = DataStoreService:GetDataStore("SkillTree_v1")
+
+-- ─────────────────────────────────────────────
+-- Remotes  (created here — client waits for them)
+-- ─────────────────────────────────────────────
+
+local function makeRemote(class, name)
+	local r = Instance.new(class)
+	r.Name   = name
+	r.Parent = ReplicatedStorage
+	return r
+end
+
+-- BindableEvents: server ↔ server bridge with DataManager
+local CoinsChangedBind = Instance.new("BindableEvent") -- DataManager fires this when coins change
+CoinsChangedBind.Name   = "CoinsChangedBind"
+CoinsChangedBind.Parent = ReplicatedStorage
+
+local DeductCoinsBind = Instance.new("BindableEvent")  -- we fire this; DataManager listens
+DeductCoinsBind.Name   = "DeductCoinsBind"
+DeductCoinsBind.Parent = ReplicatedStorage
+
+-- RemoteEvents / RemoteFunctions
+local BuySkillEvent      = makeRemote("RemoteEvent",    "BuySkillEvent")
+local GetSkillsEvent     = makeRemote("RemoteFunction", "GetSkillsEvent")
+local SkillUnlockedEvent = makeRemote("RemoteEvent",    "SkillUnlockedEvent")  -- success → client
+local CoinsUpdateEvent   = makeRemote("RemoteEvent",    "SkillCoinsUpdateEvent") -- coin mirror → client
+
+-- ─────────────────────────────────────────────
+-- In-memory store
+-- [player] = { unlocked = {[skillId]=true}, coins = number }
+-- ─────────────────────────────────────────────
+
+local playerSkills = {}
+local dirtySkills  = {}
+
+local function deepCopy(t)
+	local c = {}
+	for k, v in pairs(t) do c[k] = (type(v) == "table") and deepCopy(v) or v end
+	return c
+end
+
+-- ─────────────────────────────────────────────
+-- Load / Save  (skills only — coins live in DataManager)
+-- ─────────────────────────────────────────────
+
+local function loadSkills(player)
+	local ok, result = pcall(function()
+		return SkillDS:GetAsync("skills_" .. player.UserId)
+	end)
+
+	local unlocked = {}
+	if ok and type(result) == "table" then
+		unlocked = result.unlocked or {}
+	elseif not ok then
+		warn("[SkillTree] Load failed for " .. player.Name .. ": " .. tostring(result))
+	end
+
+	-- coins start at 0 — CoinsChangedBind will update them once DataManager fires
+	playerSkills[player] = { unlocked = unlocked, coins = 0 }
+	dirtySkills[player]  = false
+	print(("[SkillTree] Loaded skills for %s"):format(player.Name))
+end
+
+local function saveSkills(player)
+	if not dirtySkills[player] then return end
+	local data = playerSkills[player]
+	if not data then return end
+
+	local ok, err = pcall(function()
+		-- Only save the unlocked table — coins are DataManager's responsibility
+		SkillDS:SetAsync("skills_" .. player.UserId, { unlocked = data.unlocked })
+	end)
+
+	if ok then
+		dirtySkills[player] = false
+	else
+		warn("[SkillTree] Save failed for " .. player.Name .. ": " .. tostring(err))
+	end
+end
+
+-- ─────────────────────────────────────────────
+-- Coin mirror
+-- DataManager fires CoinsChangedBind(player, newTotal) whenever coins change.
+-- We mirror the value so BuySkill can check affordability, and push to client.
+-- ─────────────────────────────────────────────
+
+CoinsChangedBind.Event:Connect(function(player, newTotal)
+	local data = playerSkills[player]
+	if not data then return end
+	data.coins = newTotal
+	-- Push updated total to the client's skill tree UI
+	CoinsUpdateEvent:FireClient(player, newTotal)
+end)
+
+-- ─────────────────────────────────────────────
+-- GetSkills remote function  (called by client on open)
+-- ─────────────────────────────────────────────
+
+GetSkillsEvent.OnServerInvoke = function(player)
+	local data = playerSkills[player]
+	if not data then return { unlocked = {}, coins = 0 } end
+	return { unlocked = deepCopy(data.unlocked), coins = data.coins }
+end
+
+-- ─────────────────────────────────────────────
+-- BuySkill handler
+-- ─────────────────────────────────────────────
+
+BuySkillEvent.OnServerEvent:Connect(function(player, skillId)
+	local data = playerSkills[player]
+	if not data then return end
+
+	-- Already owned?
+	if data.unlocked[skillId] then return end
+
+	local skill = SkillTree.GetSkill(skillId)
+	if not skill then
+		warn(("[SkillTree] Unknown skillId '%s' from %s"):format(tostring(skillId), player.Name))
+		return
+	end
+
+	-- Prerequisites met?
+	if not SkillTree.CanUnlock(skillId, data.unlocked) then
+		warn(("[SkillTree] %s tried to buy '%s' without prereqs"):format(player.Name, skillId))
+		return
+	end
+
+	-- Affordable?  (data.coins is kept fresh by CoinsChangedBind)
+	if data.coins < skill.Cost then
+		warn(("[SkillTree] %s can't afford '%s' (%d/%d)"):format(
+			player.Name, skillId, data.coins, skill.Cost))
+		return
+	end
+
+	-- Deduct coins through DataManager
+	-- DataManager listens to DeductCoinsBind and subtracts the amount, then
+	-- fires CoinsChangedBind back so our mirror (and client) stays in sync.
+	DeductCoinsBind:Fire(player, skill.Cost)
+
+	data.unlocked[skillId] = true
+	dirtySkills[player]    = true
+
+	print(("[SkillTree] %s unlocked '%s'"):format(player.Name, skillId))
+
+	-- Tell the client: skillId + refreshed coin total
+	-- (data.coins will update via CoinsChangedBind fired by DataManager,
+	--  but we send the optimistic value now for instant UI feedback)
+	local optimisticCoins = math.max(0, data.coins - skill.Cost)
+	SkillUnlockedEvent:FireClient(player, skillId, optimisticCoins)
+end)
+
+-- ─────────────────────────────────────────────
+-- Periodic save  (every 60 s, rate-limited)
+-- ─────────────────────────────────────────────
+
+task.spawn(function()
+	while true do
+		task.wait(60)
+		local list = Players:GetPlayers()
+		for i, p in ipairs(list) do
+			saveSkills(p)
+			if i < #list then task.wait(0.5) end
+		end
+	end
+end)
+
+-- ─────────────────────────────────────────────
+-- Player lifecycle
+-- ─────────────────────────────────────────────
+
+Players.PlayerAdded:Connect(loadSkills)
+
+for _, player in ipairs(Players:GetPlayers()) do
+	loadSkills(player)
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	saveSkills(player)
+	playerSkills[player] = nil
+	dirtySkills[player]  = nil
+end)
+
+game:BindToClose(function()
+	for _, p in ipairs(Players:GetPlayers()) do
+		if dirtySkills[p] then task.spawn(saveSkills, p) end
+	end
+	task.wait(2)
+end)
