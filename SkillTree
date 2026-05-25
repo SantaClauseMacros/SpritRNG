@@ -1,0 +1,280 @@
+-- SkillTree.lua  (ModuleScript in ReplicatedStorage)
+-- Single source of truth for every skill node.
+-- Unchanged from original — no bugs found here.
+
+local SkillTree = {}
+
+SkillTree.HexSize = 56
+SkillTree.GapX    = 8
+SkillTree.GapY    = 6
+
+SkillTree.Skills = {
+
+	-- ── COLUMN 0 (centre trunk) ──────────────────────────────────────────────
+	{
+		Id          = "RollLuck1",
+		DisplayName = "Roll Luck",
+		Description = "Slightly improves your odds on every roll.",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(255, 200, 50),
+		Col = 0, Row = 0,
+		Requires    = {},
+		Cost        = 0,
+		Effect      = "luck_add",
+		Value       = 0.0002,
+	},
+	{
+		Id          = "RollLuck2",
+		DisplayName = "Luckier",
+		Description = "Your luck improves even further.",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(255, 200, 50),
+		Col = 0, Row = 1,
+		Requires    = { "RollLuck1" },
+		Cost        = 2000,
+		Effect      = "luck_add",
+		Value       = 0.0005,
+	},
+	{
+		Id          = "AutoRoll",
+		DisplayName = "Auto Roll",
+		Description = "Unlocks the auto-roll feature.",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(100, 180, 255),
+		Col = 0, Row = 2,
+		Requires    = { "RollLuck2" },
+		Cost        = 5000,
+		Effect      = "none",
+		Value       = 0,
+	},
+	{
+		Id          = "FasterAuto",
+		DisplayName = "Faster Auto Roll",
+		Description = "Auto-roll fires 30% faster.",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(100, 180, 255),
+		Col = 0, Row = 3,
+		Requires    = { "AutoRoll" },
+		Cost        = 12000,
+		Effect      = "auto_delay",
+		Value       = 0.7,
+	},
+	{
+		Id          = "TurboAuto",
+		DisplayName = "Turbo Auto Roll",
+		Description = "Auto-roll fires 50% faster (stacks with Faster Auto Roll).",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(100, 180, 255),
+		Col = 0, Row = 4,
+		Requires    = { "FasterAuto" },
+		Cost        = 30000,
+		Effect      = "auto_delay",
+		Value       = 0.5,
+	},
+	{
+		Id          = "DailyBonus",
+		DisplayName = "Daily Bonus Roll",
+		Description = "Get one free bonus roll per day worth 10x coins.",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(255, 200, 50),
+		Col = 0, Row = 5,
+		Requires    = { "TurboAuto" },
+		Cost        = 60000,
+		Effect      = "daily_bonus",
+		Value       = 10,
+	},
+
+	-- ── COLUMN -1 (left branch) ──────────────────────────────────────────────
+	{
+		Id          = "CoinBoost1",
+		DisplayName = "Coin Boost",
+		Description = "Earn 20% more coins on every roll.",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(255, 200, 50),
+		Col = -1, Row = 0,
+		Requires    = {},
+		Cost        = 0,
+		Effect      = "coins_mult",
+		Value       = 1.2,
+	},
+	{
+		Id          = "CoinBoost2",
+		DisplayName = "Bigger Coins",
+		Description = "Earn 50% more coins on every roll.",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(255, 200, 50),
+		Col = -1, Row = 1,
+		Requires    = { "CoinBoost1" },
+		Cost        = 3000,
+		Effect      = "coins_mult",
+		Value       = 1.5,
+	},
+	{
+		Id          = "RareBonus",
+		DisplayName = "Rare Bonus",
+		Description = "Rare and above spirits give 1.5x coins.",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(100, 180, 255),
+		Col = -1, Row = 2,
+		Requires    = { "CoinBoost2" },
+		Cost        = 8000,
+		Effect      = "rare_mult",
+		Value       = 1.5,
+	},
+	{
+		Id          = "EpicBonus",
+		DisplayName = "Epic Bonus",
+		Description = "Epic and above spirits give 2x coins.",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(180, 100, 255),
+		Col = -1, Row = 3,
+		Requires    = { "RareBonus" },
+		Cost        = 20000,
+		Effect      = "epic_mult",
+		Value       = 2.0,
+	},
+	{
+		Id          = "MythicBonus",
+		DisplayName = "Mythic Bonus",
+		Description = "Mythic spirits give 5x coins.",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(180, 100, 255),
+		Col = -1, Row = 4,
+		Requires    = { "EpicBonus" },
+		Cost        = 80000,
+		Effect      = "mythic_mult",
+		Value       = 5.0,
+	},
+
+	-- ── COLUMN 1 (right branch) ──────────────────────────────────────────────
+	{
+		Id          = "HideRolls",
+		DisplayName = "Hide Rolls",
+		Description = "Unlocks the 'Hide Rolls' button during auto-roll.",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(100, 180, 255),
+		Col = 1, Row = 0,
+		Requires    = {},
+		Cost        = 0,
+		Effect      = "auto_hide",
+		Value       = 1,
+	},
+	{
+		Id          = "InvSort",
+		DisplayName = "Inv. Sort",
+		Description = "Unlocks additional inventory sorting options.",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(100, 200, 140),
+		Col = 1, Row = 1,
+		Requires    = { "HideRolls" },
+		Cost        = 1500,
+		Effect      = "inv_sort",
+		Value       = 1,
+	},
+	{
+		Id          = "RollItems",
+		DisplayName = "Roll Items",
+		Description = "Spirits sometimes drop bonus item rewards.",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(255, 200, 50),
+		Col = 1, Row = 2,
+		Requires    = { "InvSort" },
+		Cost        = 10000,
+		Effect      = "luck_add",
+		Value       = 0.001,
+	},
+	{
+		Id          = "BetterItems",
+		DisplayName = "Better Items",
+		Description = "Dropped items are of higher quality.",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(255, 200, 50),
+		Col = 1, Row = 3,
+		Requires    = { "RollItems" },
+		Cost        = 25000,
+		Effect      = "luck_add",
+		Value       = 0.002,
+	},
+	{
+		Id          = "EliteDrops",
+		DisplayName = "Elite Drops",
+		Description = "Rare chance for elite-tier item drops.",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(180, 100, 255),
+		Col = 1, Row = 4,
+		Requires    = { "BetterItems" },
+		Cost        = 75000,
+		Effect      = "luck_add",
+		Value       = 0.005,
+	},
+
+	-- ── COLUMN -2 (far left) ─────────────────────────────────────────────────
+	{
+		Id          = "FarmingGold",
+		DisplayName = "Farming Gold",
+		Description = "Idle coins trickle in over time.",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(255, 200, 50),
+		Col = -2, Row = 3,
+		Requires    = { "EpicBonus" },
+		Cost        = 40000,
+		Effect      = "coins_mult",
+		Value       = 2.0,
+	},
+	{
+		Id          = "RandomBonus",
+		DisplayName = "Random Bonus",
+		Description = "Random 2x-5x coin multiplier on any roll.",
+		Icon        = "",
+		NodeColor   = Color3.fromRGB(255, 200, 50),
+		Col = -2, Row = 4,
+		Requires    = { "FarmingGold" },
+		Cost        = 90000,
+		Effect      = "coins_mult",
+		Value       = 3.0,
+	},
+}
+
+-- ─────────────────────────────────────────────
+-- Lookup (built once at require-time)
+-- ─────────────────────────────────────────────
+
+local lookup = {}
+for _, skill in ipairs(SkillTree.Skills) do
+	lookup[skill.Id] = skill
+end
+
+function SkillTree.GetSkill(id)
+	return lookup[id]
+end
+
+function SkillTree.CanUnlock(skillId, unlockedSet)
+	local skill = lookup[skillId]
+	if not skill then return false end
+	for _, req in ipairs(skill.Requires) do
+		if not unlockedSet[req] then return false end
+	end
+	return true
+end
+
+local MULTIPLICATIVE = {
+	coins_mult = true, auto_delay  = true,
+	rare_mult  = true, epic_mult   = true, mythic_mult = true,
+}
+
+function SkillTree.GetEffectValue(effectKey, unlockedSet)
+	local result = MULTIPLICATIVE[effectKey] and 1 or 0
+	for id in pairs(unlockedSet) do
+		local skill = lookup[id]
+		if skill and skill.Effect == effectKey then
+			if MULTIPLICATIVE[effectKey] then
+				result *= skill.Value
+			else
+				result += skill.Value
+			end
+		end
+	end
+	return result
+end
+
+return SkillTree
