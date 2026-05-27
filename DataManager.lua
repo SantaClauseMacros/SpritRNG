@@ -171,7 +171,7 @@ RollEvent.OnServerEvent:Connect(function(player)
 
 	print(("[DataManager] %s rolled %s (%s) | +%d coins | total: %d"):format(
 		player.Name, result, rarity, coinsEarned, data.coins
-	))
+		))
 
 	RollEvent:FireClient(player, result, coinsEarned, data.coins)
 
@@ -220,6 +220,18 @@ if DeductCoinsBind then
 		if CoinsChangedBind then
 			CoinsChangedBind:Fire(player, data.coins)
 		end
+	end)
+end
+
+-- ── Expedition coin grant (AddCoinsBind fired by ExpeditionServer) ───────────
+local AddCoinsBind = ReplicatedStorage:WaitForChild("AddCoinsBind", 10)
+if AddCoinsBind then
+	AddCoinsBind.Event:Connect(function(player, amount)
+		local data = playerData[player]
+		if not data then return end
+		data.coins         = data.coins + math.floor(amount)
+		dirtyFlags[player] = true
+		if CoinsChangedBind then CoinsChangedBind:Fire(player, data.coins) end
 	end)
 end
 
